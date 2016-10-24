@@ -80,6 +80,10 @@ private[spark] class SparkUI private (
   }
   initialize()
 
+  def getSparkUser: String = {
+    environmentListener.systemProperties.toMap.get("user.name").getOrElse("<unknown>")
+  }
+
   def getAppName: String = appName
 
   def setAppId(id: String): Unit = {
@@ -121,6 +125,10 @@ private[spark] class SparkUI private (
         completed = false
       ))
     ))
+  }
+
+  def getApplicationInfo(appId: String): Option[ApplicationInfo] = {
+    getApplicationInfoList.find(_.id == appId)
   }
 }
 

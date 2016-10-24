@@ -18,16 +18,19 @@
 package org.apache.spark.sql.execution.streaming
 
 import java.util.concurrent.atomic.AtomicInteger
+import javax.annotation.concurrent.GuardedBy
 
 import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
 
-import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.{DataFrame, Dataset, Encoder, Row, SQLContext}
-import org.apache.spark.sql.catalyst.encoders.{encoderFor, RowEncoder}
-import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql._
+import org.apache.spark.sql.catalyst.encoders.encoderFor
+import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.plans.logical.LeafNode
+import org.apache.spark.sql.streaming.OutputMode
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.Utils
 
 object MemoryStream {
   protected val currentBlockId = new AtomicInteger(0)
@@ -45,20 +48,23 @@ object MemoryStream {
 case class MemoryStream[A : Encoder](id: Int, sqlContext: SQLContext)
     extends Source with Logging {
   protected val encoder = encoderFor[A]
-  protected val logicalPlan = StreamingRelation(this)
+  protected val logicalPlan = StreamingExecutionRelation(this)
   protected val output = logicalPlan.output
+
+  @GuardedBy("this")
   protected val batches = new ArrayBuffer[Dataset[A]]
 
+  @GuardedBy("this")
   protected var currentOffset: LongOffset = new LongOffset(-1)
 
   def schema: StructType = encoder.schema
 
   def toDS()(implicit sqlContext: SQLContext): Dataset[A] = {
-    Dataset(sqlContext, logicalPlan)
+    Dataset(sqlContext.sparkSession, logicalPlan)
   }
 
   def toDF()(implicit sqlContext: SQLContext): DataFrame = {
-    Dataset.ofRows(sqlContext, logicalPlan)
+    Dataset.ofRows(sqlContext.sparkSession, logicalPlan)
   }
 
   def addData(data: A*): Offset = {
@@ -67,40 +73,49 @@ case class MemoryStream[A : Encoder](id: Int, sqlContext: SQLContext)
 
   def addData(data: TraversableOnce[A]): Offset = {
     import sqlContext.implicits._
+    val ds = data.toVector.toDS()
+    logDebug(s"Adding ds: $ds")
     this.synchronized {
       currentOffset = currentOffset + 1
-      val ds = data.toVector.toDS()
-      logDebug(s"Adding ds: $ds")
-      batches.append(ds)
+      batches += ds
       currentOffset
     }
   }
 
-  override def toString: String = s"MemoryStream[${output.mkString(",")}]"
+  override def toString: String = s"MemoryStream[${Utils.truncatedString(output, ",")}]"
 
-  override def getOffset: Option[Offset] = if (batches.isEmpty) {
-    None
-  } else {
-    Some(currentOffset)
+  override def getOffset: Option[Offset] = synchronized {
+    if (batches.isEmpty) {
+      None
+    } else {
+      Some(currentOffset)
+    }
   }
 
   /**
-   * Returns the next batch of data that is available after `start`, if any is available.
+   * Returns the data that is between the offsets (`start`, `end`].
    */
   override def getBatch(start: Option[Offset], end: Offset): DataFrame = {
     val startOrdinal =
       start.map(_.asInstanceOf[LongOffset]).getOrElse(LongOffset(-1)).offset.toInt + 1
     val endOrdinal = end.asInstanceOf[LongOffset].offset.toInt + 1
-    val newBlocks = batches.slice(startOrdinal, endOrdinal)
+    val newBlocks = synchronized { batches.slice(startOrdinal, endOrdinal) }
 
     logDebug(
       s"MemoryBatch [$startOrdinal, $endOrdinal]: ${newBlocks.flatMap(_.collect()).mkString(", ")}")
     newBlocks
       .map(_.toDF())
-      .reduceOption(_ unionAll _)
+      .reduceOption(_ union _)
       .getOrElse {
         sys.error("No data selected!")
       }
+  }
+
+  override def stop() {}
+
+  def reset(): Unit = synchronized {
+    batches.clear()
+    currentOffset = new LongOffset(-1)
   }
 }
 
@@ -108,31 +123,60 @@ case class MemoryStream[A : Encoder](id: Int, sqlContext: SQLContext)
  * A sink that stores the results in memory. This [[Sink]] is primarily intended for use in unit
  * tests and does not provide durability.
  */
-class MemorySink(schema: StructType) extends Sink with Logging {
+class MemorySink(val schema: StructType, outputMode: OutputMode) extends Sink with Logging {
+
+  private case class AddedData(batchId: Long, data: Array[Row])
+
   /** An order list of batches that have been written to this [[Sink]]. */
-  private val batches = new ArrayBuffer[Array[Row]]()
+  @GuardedBy("this")
+  private val batches = new ArrayBuffer[AddedData]()
 
   /** Returns all rows that are stored in this [[Sink]]. */
   def allData: Seq[Row] = synchronized {
-    batches.flatten
+    batches.map(_.data).flatten
   }
 
+  def latestBatchId: Option[Long] = synchronized {
+    batches.lastOption.map(_.batchId)
+  }
+
+  def latestBatchData: Seq[Row] = synchronized { batches.lastOption.toSeq.flatten(_.data) }
+
   def toDebugString: String = synchronized {
-    batches.zipWithIndex.map { case (b, i) =>
-      val dataStr = try b.mkString(" ") catch {
+    batches.map { case AddedData(batchId, data) =>
+      val dataStr = try data.mkString(" ") catch {
         case NonFatal(e) => "[Error converting to string]"
       }
-      s"$i: $dataStr"
+      s"$batchId: $dataStr"
     }.mkString("\n")
   }
 
-  override def addBatch(batchId: Long, data: DataFrame): Unit = {
-    if (batchId == batches.size) {
-      logDebug(s"Committing batch $batchId")
-      batches.append(data.collect())
+  override def addBatch(batchId: Long, data: DataFrame): Unit = synchronized {
+    if (latestBatchId.isEmpty || batchId > latestBatchId.get) {
+      logDebug(s"Committing batch $batchId to $this")
+      outputMode match {
+        case InternalOutputModes.Append | InternalOutputModes.Update =>
+          batches.append(AddedData(batchId, data.collect()))
+
+        case InternalOutputModes.Complete =>
+          batches.clear()
+          batches += AddedData(batchId, data.collect())
+
+        case _ =>
+          throw new IllegalArgumentException(
+            s"Output mode $outputMode is not supported by MemorySink")
+      }
     } else {
       logDebug(s"Skipping already committed batch: $batchId")
     }
   }
+
+  override def toString(): String = "MemorySink"
 }
 
+/**
+ * Used to query the data that has been written into a [[MemorySink]].
+ */
+case class MemoryPlan(sink: MemorySink, output: Seq[Attribute]) extends LeafNode {
+  def this(sink: MemorySink) = this(sink, sink.schema.toAttributes)
+}

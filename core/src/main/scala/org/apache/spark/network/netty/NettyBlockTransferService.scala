@@ -39,7 +39,13 @@ import org.apache.spark.util.Utils
 /**
  * A BlockTransferService that uses Netty to fetch a set of blocks at at time.
  */
-class NettyBlockTransferService(conf: SparkConf, securityManager: SecurityManager, numCores: Int)
+private[spark] class NettyBlockTransferService(
+    conf: SparkConf,
+    securityManager: SecurityManager,
+    bindAddress: String,
+    override val hostName: String,
+    _port: Int,
+    numCores: Int)
   extends BlockTransferService {
 
   // TODO: Don't use Java serialization, use a more cross-version compatible serialization format.
@@ -65,18 +71,17 @@ class NettyBlockTransferService(conf: SparkConf, securityManager: SecurityManage
     clientFactory = transportContext.createClientFactory(clientBootstrap.toSeq.asJava)
     server = createServer(serverBootstrap.toList)
     appId = conf.getAppId
-    logInfo("Server created on " + server.getPort)
+    logInfo(s"Server created on ${hostName}:${server.getPort}")
   }
 
   /** Creates and binds the TransportServer, possibly trying multiple ports. */
   private def createServer(bootstraps: List[TransportServerBootstrap]): TransportServer = {
     def startService(port: Int): (TransportServer, Int) = {
-      val server = transportContext.createServer(port, bootstraps.asJava)
+      val server = transportContext.createServer(bindAddress, port, bootstraps.asJava)
       (server, server.getPort)
     }
 
-    val portToTry = conf.getInt("spark.blockManager.port", 0)
-    Utils.startServiceOnPort(portToTry, startService, conf, getClass.getName)._1
+    Utils.startServiceOnPort(_port, startService, conf, getClass.getName)._1
   }
 
   override def fetchBlocks(
@@ -108,8 +113,6 @@ class NettyBlockTransferService(conf: SparkConf, securityManager: SecurityManage
         blockIds.foreach(listener.onBlockFetchFailure(_, e))
     }
   }
-
-  override def hostName: String = Utils.localHostName()
 
   override def port: Int = server.getPort
 

@@ -22,15 +22,16 @@ import org.json4s.JsonAST.JValue
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
 
-import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.annotation.InterfaceStability
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.util.Utils
 
 /**
- * :: DeveloperApi ::
  * The base type of all Spark SQL data types.
+ *
+ * @since 1.3.0
  */
-@DeveloperApi
+@InterfaceStability.Stable
 abstract class DataType extends AbstractDataType {
   /**
    * Enables matching against DataType for expressions:
@@ -62,6 +63,9 @@ abstract class DataType extends AbstractDataType {
   /** Readable string representation for the type. */
   def simpleString: String = typeName
 
+  /** String representation for the type saved in external catalogs. */
+  def catalogString: String = simpleString
+
   /** Readable string representation for the type with truncation */
   private[sql] def simpleString(maxNumberFields: Int): String = simpleString
 
@@ -91,6 +95,10 @@ abstract class DataType extends AbstractDataType {
 }
 
 
+/**
+ * @since 1.3.0
+ */
+@InterfaceStability.Stable
 object DataType {
 
   def fromJson(json: String): DataType = parseDataType(parse(json))
